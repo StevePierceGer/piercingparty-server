@@ -1,63 +1,83 @@
 from flask import Flask, jsonify
 from flask_cors import CORS
 import requests
-from bs4 import BeautifulSoup
-import re
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-def parse_seite(url):
+WP_API = "https://steve-pierce.de/wp-json/tribe/events/v1/events"
+
+def lade_partys():
     partys = []
     try:
-        r = requests.get(url, timeout=10, headers={
+        # WordPress The Events Calendar REST API
+        params = {
+            'per_page': 50,
+            'start_date': datetime.now().strftime('%Y-%m-%d'),
+            'status': 'publish'
+        }
+        r = requests.get(WP_API, params=params, timeout=15, headers={
             'User-Agent': 'Mozilla/5.0'
         })
-        soup = BeautifulSoup(r.text, 'html.parser')
-        text = soup.get_text('\n')
-        zeilen = [z.strip() for z in text.split('\n') if z.strip()]
+        r.raise_for_status()
+        data = r.json()
+        events = data.get('events', [])
 
-        i = 0
-        while i < len(zeilen):
-            z = zeilen[i]
-            m = re.match(r'^(MO|DI|MI|DO|FR|SA|SO)\s+(\d{2}\.\d{2}\.\d{4})', z)
-            if m:
-                tag = m.group(1)
-                datum = m.group(2)
-                name = ''
-                ort = ''
-                uhr = '12:00'
-                atl = False
-                for j in range(i+1, min(i+10, len(zeilen))):
-                    nz = zeilen[j]
-                    if re.match(r'^(MO|DI|MI|DO|FR|SA|SO)\s+\d', nz):
-                        break
-                    if not name and len(nz) > 3 and not re.match(r'^\d', nz):
-                        name = nz
-                    pm = re.search(r'(\d{5})\s+(\S.{2,30})', nz)
-                    if pm and not ort:
-                        ort = pm.group(1) + ' ' + pm.group(2).strip()
-                    um = re.search(r'(\d{1,2}:\d{2})', nz)
-                    if um:
-                        uhr = um.group(1)
-                    if 'atlantomed' in nz.lower():
-                        atl = True
-                partys.append({
-                    'tag': tag,
-                    'datum': datum,
-                    'name': name,
-                    'ort': ort,
-                    'uhrzeit': uhr,
-                    'atlantomed': atl
-                })
-            i += 1
-    except Exception as e:
-        print(f'Fehler: {e}')
-    return partys
+        for e in events:
+            # Datum parsen
+            start = e.get('start_date', '')  # z.B. "2026-06-26 12:00:00"
+            if not start:
+                continue
+            dt = datetime.strptime(start[:10], '%Y-%m-%d')
+            tag = ['MO','DI','MI','DO','FR','SA','SO'][dt.weekday()]
+            datum = dt.strftime('%d.%m.%Y')
+            uhr = start[11:16] if len(start) > 10 else '12:00'
+
+            # Titel = Ort (z.B. "Piercingparty 49808 Lingen")
+            titel = e.get('title', '')
+            # PLZ aus Titel oder Venue
+            venue = e.get('venue', {})
+            ort = ''
+            plz = ''
+            if venue:
+                plz = venue.get('zip', '')
+                city = venue.get('city', '')
+                ort = (plz + ' ' + city).strip()
+            if not ort:
+                ort = titel
+
+            # Atlantomed aus Beschreibung
+            desc = e.get('description', '') + e.get('excerpt', '')
+            atl = 'atlantomed' in desc.lower()
+
+            # E-Mail aus Beschreibung (z.B. lingen@steve-pierce.de)
+            import re
+            email_m = re.search(r'[\w.-]+@steve-pierce\.de', desc)
+            email = email_m.group(0) if email_m else ''
+
+            partys.append({
+                'tag': tag,
+                'datum': datum,
+                'datum_iso': dt.strftime('%Y-%m-%d'),
+                'uhrzeit': uhr,
+                'name': titel,
+                'ort': ort,
+                'plz': plz,
+                'atlantomed': atl,
+                'email': email,
+                'url': e.get('url', '')
+            })
+
+    except Exception as ex:
+        print(f'API Fehler: {ex}')
+        return [], str(ex)
+
+    return partys, None
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'ok', 'service': 'Piercingparty Tour-Planer Server'})
+    return jsonify({'status': 'ok', 'service': 'Piercingparty Tour-Planer Server v2'})
 
 @app.route('/health')
 def health():
@@ -65,13 +85,13 @@ def health():
 
 @app.route('/partys')
 def get_partys():
-    seite1 = parse_seite('https://steve-pierce.de/piercingpartys/liste/')
-    seite2 = parse_seite('https://steve-pierce.de/piercingpartys/liste/seite/2/')
-    alle = seite1 + seite2
+    partys, fehler = lade_partys()
+    if fehler:
+        return jsonify({'status': 'error', 'fehler': fehler, 'partys': [], 'anzahl': 0})
     return jsonify({
         'status': 'ok',
-        'anzahl': len(alle),
-        'partys': alle
+        'anzahl': len(partys),
+        'partys': partys
     })
 
 if __name__ == '__main__':
